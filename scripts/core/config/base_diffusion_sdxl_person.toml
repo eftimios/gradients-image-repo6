@@ -46,7 +46,7 @@ train_batch_size = 4
 gradient_accumulation_steps = 1
 
 optimizer_type = "prodigy"
-optimizer_args = ["decouple=True", "d_coef=1", "weight_decay=0.01", "use_bias_correction=True", "safeguard_warmup=True"]
+optimizer_args = ["decouple=True", "d_coef=1.2", "weight_decay=0.01", "use_bias_correction=True", "safeguard_warmup=True"]
 unet_lr = 1
 text_encoder_lr = 1
 
@@ -60,6 +60,8 @@ network_dropout = 0
 caption_dropout_rate = 0
 clip_skip = 1
 max_timestep = 1000
-min_snr_gamma = 5
+min_snr_gamma = 6
 scale_weight_norms = 5
+noise_offset_type = "Original"
+noise_offset = 0.0357
 seed = 2951032222
