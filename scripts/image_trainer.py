@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 """
-everything u are  4
+everything u are 4 - Enhanced Edition
+Tier 1 Optimizations: Size Tiers, Dynamic Warmup, Adaptive Gradient Accumulation, Model LR Multipliers, Mixed Precision
 """
 
 import argparse
@@ -26,6 +27,112 @@ import trainer.utils.training_paths as train_paths
 from core.config.config_handler import save_config, save_config_toml
 from core.dataset.prepare_diffusion_dataset import prepare_dataset
 from core.models.utility_models import ImageModelType
+
+
+# ============================================================================
+# TIER 1 OPTIMIZATIONS - High Impact Performance Enhancements
+# ============================================================================
+
+def get_size_tier_enhanced(image_count: int) -> str:
+    """Enhanced size tier selection with 7 tiers for better granularity"""
+    if 1 <= image_count <= 5:
+        return "xxs"  # Extra Extra Small - Very cautious training
+    elif 6 <= image_count <= 10:
+        return "xs"   # Extra Small
+    elif 11 <= image_count <= 20:
+        return "s"    # Small
+    elif 21 <= image_count <= 30:
+        return "m"    # Medium
+    elif 31 <= image_count <= 50:
+        return "l"    # Large
+    elif 51 <= image_count <= 100:
+        return "xl"   # Extra Large
+    else:  # 100+
+        return "xxl"  # Extra Extra Large - Maximum efficiency
+    
+
+def calculate_dynamic_warmup_steps(max_train_epochs: int, dataset_size: int, batch_size: int) -> int:
+    """Calculate warmup steps as percentage of total training steps"""
+    total_steps = (max_train_epochs * dataset_size) // max(batch_size, 1)
+    
+    # Small datasets need more warmup (10%), large datasets less (5%)
+    warmup_ratio = 0.10 if dataset_size <= 20 else 0.05
+    
+    warmup_steps = max(int(total_steps * warmup_ratio), 10)  # Minimum 10 steps
+    print(f"Calculated dynamic warmup: {warmup_steps} steps ({warmup_ratio*100}% of {total_steps} total steps)", flush=True)
+    return warmup_steps
+
+
+def calculate_adaptive_gradient_accumulation(dataset_size: int, batch_size: int, gpu_count: int = 1) -> int:
+    """Calculate optimal gradient accumulation based on dataset size and resources"""
+    # Target effective batch sizes for optimal gradient quality
+    if dataset_size <= 10:
+        target_effective_batch = 8
+    elif dataset_size <= 30:
+        target_effective_batch = 12
+    else:
+        target_effective_batch = 16
+    
+    # Calculate accumulation steps to reach target
+    current_effective = batch_size * gpu_count
+    accumulation = max(1, target_effective_batch // current_effective)
+    
+    print(f"Adaptive gradient accumulation: {accumulation} steps (target effective batch: {target_effective_batch})", flush=True)
+    return accumulation
+
+
+def get_model_lr_multiplier(model_name: str) -> float:
+    """Model-specific learning rate multipliers based on training characteristics"""
+    model_lr_multipliers = {
+        # Baseline models (1.0)
+        "stabilityai/stable-diffusion-xl-base-1.0": 1.0,
+        
+        # More sensitive models - need lower LR (0.85-0.95)
+        "cagliostrolab/animagine-xl-4.0": 0.85,
+        "John6666/nova-anime-xl-pony-v5-sdxl": 0.95,
+        "KBlueLeaf/Kohaku-XL-Zeta": 0.90,
+        "John6666/hassaku-xl-illustrious-v10style-sdxl": 0.92,
+        
+        # Robust models - can handle higher LR (1.10-1.15)
+        "SG161222/RealVisXL_V4.0": 1.15,
+        "dataautogpt3/ProteusV0.5": 1.10,
+        "dataautogpt3/ProteusSigma": 1.12,
+        
+        # Moderate adjustments (0.95-1.05)
+        "Lykon/dreamshaper-xl-1-0": 1.02,
+        "dataautogpt3/CALAMITY": 0.98,
+        "dataautogpt3/TempestV0.1": 1.05,
+        "Corcelio/mobius": 0.97,
+    }
+    
+    multiplier = model_lr_multipliers.get(model_name, 1.0)
+    if multiplier != 1.0:
+        print(f"Model LR multiplier for '{model_name}': {multiplier}x", flush=True)
+    return multiplier
+
+
+def get_mixed_precision_config(model_type: str, dataset_size: int) -> str:
+    """Select optimal mixed precision based on model type and dataset size"""
+    # BF16: More stable, better for small datasets and large models
+    # FP16: Faster, good for most cases with sufficient data
+    
+    if model_type in ["flux"]:
+        # Flux models are large, prefer bf16 for stability
+        precision = "bf16"
+    elif dataset_size < 5:
+        # Very small datasets need maximum stability
+        precision = "bf16"
+    else:
+        # Standard case: fp16 is faster
+        precision = "fp16"
+    
+    print(f"Selected mixed precision: {precision} (model_type={model_type}, dataset_size={dataset_size})", flush=True)
+    return precision
+
+
+# ============================================================================
+# END TIER 1 OPTIMIZATIONS
+# ============================================================================
 
 
 def get_model_path(path: str) -> str:
@@ -136,7 +243,7 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
         config_path = os.path.join(train_cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH, f"{task_id}.yaml")
         save_config(config, config_path)
         print(f"Created ai-toolkit config at {config_path}", flush=True)
-        return config_path
+        return config_path, 0  # Return dataset_size=0 for ai-toolkit (not used)
     else:
         with open(config_template_path, "r") as file:
             config = toml.load(file)
@@ -160,25 +267,58 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
                     for key, value in lrs_settings.items():
                         config[key] = value
                 else:
-                    size_key = None
-                    if 1 <= dataset_size <= 10:
-                        size_key = "xs"
-                    elif 11 <= dataset_size <= 20:
-                        size_key = "s"
-                    elif 21 <= dataset_size <= 30:
-                        size_key = "m"
-                    elif 31 <= dataset_size <= 50:
-                        size_key = "l"
-                    elif 51 <= dataset_size <= 1000:
-                        size_key = "xl"
+                    # TIER 1 ENHANCEMENT: Use enhanced 7-tier size selection
+                    size_key = get_size_tier_enhanced(dataset_size)
                     
                     if size_key and size_key in lrs_settings:
-                        print(f"Applying model-specific config for size '{size_key}'", flush=True)
+                        print(f"Applying model-specific config for size '{size_key}' ({dataset_size} images)", flush=True)
+                        
+                        # Apply base config from size tier
                         for key, value in lrs_settings[size_key].items():
                             config[key] = value
                         size_config_loaded = True
+                        
+                        # TIER 1 ENHANCEMENT: Apply model-specific LR multiplier
+                        lr_multiplier = get_model_lr_multiplier(model_name)
+                        if "unet_lr" in config:
+                            original_unet_lr = config["unet_lr"]
+                            config["unet_lr"] = original_unet_lr * lr_multiplier
+                            if lr_multiplier != 1.0:
+                                print(f"Adjusted unet_lr: {original_unet_lr} → {config['unet_lr']} (×{lr_multiplier})", flush=True)
+                        
+                        if "text_encoder_lr" in config:
+                            original_te_lr = config["text_encoder_lr"]
+                            config["text_encoder_lr"] = original_te_lr * lr_multiplier
+                            if lr_multiplier != 1.0:
+                                print(f"Adjusted text_encoder_lr: {original_te_lr} → {config['text_encoder_lr']} (×{lr_multiplier})", flush=True)
+                        
+                        # TIER 1 ENHANCEMENT: Calculate dynamic warmup steps
+                        # Only set warmup for schedulers that support it
+                        if "max_train_epochs" in config and "train_batch_size" in config:
+                            lr_scheduler = config.get("lr_scheduler", "constant")
+                            # constant scheduler doesn't support warmup
+                            if lr_scheduler != "constant":
+                                dynamic_warmup = calculate_dynamic_warmup_steps(
+                                    config["max_train_epochs"],
+                                    dataset_size,
+                                    config["train_batch_size"]
+                                )
+                                config["lr_warmup_steps"] = dynamic_warmup
+                            else:
+                                # Ensure no warmup steps for constant scheduler
+                                config["lr_warmup_steps"] = 0
+                        
+                        # TIER 1 ENHANCEMENT: Calculate adaptive gradient accumulation
+                        if "train_batch_size" in config:
+                            adaptive_grad_accum = calculate_adaptive_gradient_accumulation(
+                                dataset_size,
+                                config["train_batch_size"],
+                                gpu_count=1  # Can be parameterized from environment
+                            )
+                            config["gradient_accumulation_steps"] = adaptive_grad_accum
                     else:
                         print(f"Warning: No size configuration '{size_key}' found for model '{model_name}'.", flush=True)
+                        print(f"Available tiers in config: {list(lrs_settings.keys())}", flush=True)
             else:
                 print(f"Warning: No LRS configuration found for model '{model_name}'", flush=True)
         else:
@@ -306,13 +446,16 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
         save_config_toml(config, config_path)
         print(f"config is {config}", flush=True)
         print(f"Created config at {config_path}", flush=True)
-        return config_path
+        return config_path, dataset_size  # Return dataset_size for mixed precision selection
 
 
-def run_training(model_type, config_path):
+def run_training(model_type, config_path, dataset_size=50):
     print(f"Starting training with config: {config_path}", flush=True)
 
     is_ai_toolkit = model_type in [ImageModelType.Z_IMAGE.value, ImageModelType.QWEN_IMAGE.value]
+    
+    # TIER 1 ENHANCEMENT: Get optimal mixed precision for this training
+    mixed_precision = get_mixed_precision_config(model_type, dataset_size)
     
     if is_ai_toolkit:
         training_command = [
@@ -326,7 +469,7 @@ def run_training(model_type, config_path):
                 "accelerate", "launch",
                 "--dynamo_backend", "no",
                 "--dynamo_mode", "default",
-                "--mixed_precision", "bf16",
+                "--mixed_precision", mixed_precision,  # Dynamic precision
                 "--num_processes", "1",
                 "--num_machines", "1",
                 "--num_cpu_threads_per_process", "2",
@@ -338,7 +481,7 @@ def run_training(model_type, config_path):
                 "accelerate", "launch",
                 "--dynamo_backend", "no",
                 "--dynamo_mode", "default",
-                "--mixed_precision", "bf16",
+                "--mixed_precision", mixed_precision,  # Dynamic precision
                 "--num_processes", "1",
                 "--num_machines", "1",
                 "--num_cpu_threads_per_process", "2",
@@ -405,7 +548,7 @@ async def main():
         output_dir=train_cst.IMAGE_CONTAINER_IMAGES_PATH
     )
 
-    config_path = create_config(
+    config_path, dataset_size = create_config(
         args.task_id,
         model_path,
         args.model,
@@ -414,7 +557,7 @@ async def main():
         args.trigger_word,
     )
 
-    run_training(args.model_type, config_path)
+    run_training(args.model_type, config_path, dataset_size)
 
 
 if __name__ == "__main__":
